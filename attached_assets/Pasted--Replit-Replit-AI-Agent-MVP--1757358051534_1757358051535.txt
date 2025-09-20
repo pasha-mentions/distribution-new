@@ -1,0 +1,286 @@
+Ось готовий «копі-пасти» промпт для Replit (або Replit AI Agent), який з нуля згенерує MVP дистрибуційного сервісу для музики.
+
+---
+
+# PROMPT ДЛЯ REPLIT: “Muzika Distribution — UGC Music Distributor MVP”
+
+## Мета
+
+Створити веб-платформу, де артисти/лейбли можуть:
+
+1. створювати акаунт/лейбл, проходити KYC, підключати виплати;
+2. **завантажувати музику** (аудіо + обкладинка), вводити **метадані** (треки, автори, ISRC/ISWC, UPC, права, території, explicit), керувати релізами;
+3. переглядати **каталог завантажених релізів/треків** зі статусами;
+4. (на рівні MVP) надсилати релізи у **чергу доставки до DSP** (Spotify/Apple/YouTube Music тощо) через **адаптер з мок-постачанням**;
+5. отримувати **базові звіти** (мок доходів), керувати сплітами, заявляти виведення коштів.
+
+## Техстек
+
+* **Frontend**: Next.js 14 (App Router), TypeScript, TailwindCSS, shadcn/ui.
+* **Backend**: Next.js API Routes + tRPC або REST.
+* **БД**: Postgres + Prisma ORM.
+* **Файли**: S3-сумісне сховище (Replit storage/S3/MinIO) через presigned URLs.
+* **Auth**: NextAuth (Email+Password, Google OAuth).
+* **Платежі/виплати**: Stripe (Products/Plans для підписок + Connect для payout), з webhooks.
+* **Фонові задачі**: cron (Replit Scheduler) для доставки у DSP (мок), імпорту звітів (мок).
+* **Логи та аудит**: simple audit log таблиця.
+* **Валідація**: Zod (на API і формах).
+
+## Ролі та доступ
+
+* **Artist** (одноосібний артист/правовласник).
+* **Label** (акаунт з кількома артистами, керування правами).
+* **Team Member** (доступ за запрошенням до каталогу/релізів).
+* **Admin** (модерація, QC, takedown, виплати, керування адаптерами DSP).
+
+RBAC: middleware на сторінках + серверні гварди на ендпойнтах.
+
+## Ключові модулі (UI)
+
+1. **/dashboard** — огляд акаунта: KYC/виплати, план, ліміти, останні релізи, статуси доставки.
+2. **/catalog** — перелік релізів і треків із фільтрами (статус, артист, UPC/ISRC, дата).
+3. **/releases/new** — майстер створення релізу:
+
+   * **Step 1: Release info** — назва, артист(и), тип (single/EP/album), жанр, дата релізу, первинна територія, UPC (авто або вручну), лейбл, P-copyright.
+   * **Step 2: Tracks** — додати треки: назва, ISRC (авто/ручний), version (radio/edit/instrumental), порядковий №, автори/композитори/видавці, ролі учасників, explicit, прев’ю, **завантаження аудіо** (WAV/FLAC, 16/24-bit, 44.1kHz), lyrics (LRC/текст).
+   * **Step 3: Artwork** — **обкладинка** (3000×3000, JPG/PNG, RGB, без логотипів DSP/URL/бордерів, без порнографії/хейт-символіки), авто-валідація розміру/формату.
+   * **Step 4: Rights & Territories** — всесвіт/обрані країни, дата доступності, ексклюзивність, власник майстер-прав.
+   * **Step 5: Splits** — частки виплат по треках (відсотки) для співвласників/учасників (email-інвайти).
+   * **Step 6: Review & Submit** — підсумок, чеклист QC, підтвердження ToS.
+4. **/release/\[id]** — картка релізу: метадані, треки, QC-warnings, історія змін, кнопки “Submit to Stores”, “Takedown”, “Update”.
+5. **/reports** — мок-звітність: місячні доходи по DSP/територіях/релізах/треках; CSV експорт.
+6. **/payouts** — баланс акаунта, спліти за період, запит на виведення (Stripe Connect).
+7. **/settings** — профіль, KYC/KYB, платіжні дані, члени команди, API-ключі (для масового імпорту).
+8. **/admin** — модуль модерації: черга QC, релізи в черзі доставок, контент-ID/дублікат-чек, takedown запити, користувачі.
+
+## База даних (Prisma — скорочено)
+
+```prisma
+enum Role { ARTIST LABEL TEAM ADMIN }
+enum ReleaseType { SINGLE EP ALBUM }
+enum ReleaseStatus { DRAFT IN_REVIEW APPROVED DELIVERING DELIVERED TAKEDOWN REJECTED }
+enum TrackStatus { DRAFT READY DELIVERED }
+enum QCIssueSeverity { INFO WARN ERROR }
+enum ReportSource { SPOTIFY APPLE YT_MUSIC DEEZER TIKTOK IG SHORTS OTHER }
+
+model User {
+  id        String @id @default(cuid())
+  email     String @unique
+  name      String?
+  role      Role   @default(ARTIST)
+  accounts  Account[]
+  orgs      OrgMember[]
+  splits    SplitShare[]
+  createdAt DateTime @default(now())
+}
+
+model Organization { // Label або Artist-Org (solo)
+  id        String   @id @default(cuid())
+  name      String
+  type      String   // "ARTIST_ORG" | "LABEL"
+  members   OrgMember[]
+  artists   Artist[]
+  releases  Release[]
+  balance   Int      @default(0) // cents
+  createdAt DateTime @default(now())
+}
+
+model OrgMember {
+  id        String @id @default(cuid())
+  orgId     String
+  userId    String
+  role      String   // "OWNER" | "MANAGER" | "EDITOR" | "VIEWER"
+  organization Organization @relation(fields: [orgId], references: [id])
+  user      User @relation(fields: [userId], references: [id])
+}
+
+model Artist {
+  id        String @id @default(cuid())
+  orgId     String
+  name      String
+  upcPrefix String? // для генерації UPC/ISRC
+  organization Organization @relation(fields: [orgId], references: [id])
+  releases  Release[]
+}
+
+model Release {
+  id          String @id @default(cuid())
+  orgId       String
+  artistId    String
+  type        ReleaseType
+  title       String
+  upc         String?
+  primaryGenre String?
+  releaseDate DateTime?
+  status      ReleaseStatus @default(DRAFT)
+  territories String[] // ISO-коди
+  rightsOwner String?
+  artworkUrl  String?
+  qcs         QCItem[]
+  tracks      Track[]
+  splits      SplitShare[]
+  createdAt   DateTime @default(now())
+  organization Organization @relation(fields: [orgId], references: [id])
+  artist      Artist @relation(fields: [artistId], references: [id])
+}
+
+model Track {
+  id        String @id @default(cuid())
+  releaseId String
+  title     String
+  isrc      String?
+  index     Int
+  explicit  Boolean @default(false)
+  audioUrl  String?
+  lyrics    String?
+  participants Json? // автори/композитори/видавці/ролі
+  status    TrackStatus @default(DRAFT)
+  createdAt DateTime @default(now())
+  release   Release @relation(fields: [releaseId], references: [id])
+}
+
+model SplitShare {
+  id        String @id @default(cuid())
+  releaseId String?
+  trackId   String?
+  userId    String? // якщо існує в системі
+  email     String  // якщо ще не зареєстрований
+  percent   Float
+  role      String? // "artist"|"producer"|...
+  release   Release? @relation(fields: [releaseId], references: [id])
+  track     Track?   @relation(fields: [trackId], references: [id])
+  user      User?    @relation(fields: [userId], references: [id])
+}
+
+model DeliveryJob {
+  id        String @id @default(cuid())
+  releaseId String
+  target    String // "SPOTIFY"|"APPLE"|... (мок)
+  status    String // "PENDING"|"SENT"|"FAILED"
+  payload   Json
+  response  Json?
+  createdAt DateTime @default(now())
+  release   Release @relation(fields: [releaseId], references: [id])
+}
+
+model ReportRow {
+  id        String @id @default(cuid())
+  orgId     String
+  period    String // "2025-07" тощо
+  source    ReportSource
+  territory String
+  upc       String?
+  isrc      String?
+  units     Int
+  revenueCents Int
+  createdAt DateTime @default(now())
+  organization Organization @relation(fields: [orgId], references: [id])
+}
+
+model AuditLog {
+  id        String @id @default(cuid())
+  orgId     String?
+  userId    String?
+  action    String
+  entity    String?
+  entityId  String?
+  data      Json?
+  createdAt DateTime @default(now())
+}
+```
+
+## Бізнес-логіка та правила QC
+
+* **Аудіо**: WAV/FLAC, 44.1kHz, 16/24-bit; довжина > 30 сек; файл < 200MB (конфігур.).
+* **Обкладинка**: 3000×3000, JPG/PNG, RGB, без бордерів/водяних знаків/URL/QR/логотипів DSP, без забороненого контенту.
+* **Метадані**: титли без CAPS LOCK/emoji-спаму (м’які правила), версії (Remix/Radio Edit) у полі version, explicit флаг.
+* **Ідентифікатори**: авто-генерація **UPC** (на реліз) і **ISRC** (на трек) при відсутності.
+* **Права/території**: всесвіт або whitelist країн; власник прав — орг/лейбл.
+* **Спліти**: сума по релізу/треку = 100% (валідація).
+* **Статуси**: DRAFT → IN\_REVIEW (QC) → APPROVED → DELIVERING → DELIVERED; Takedown → TAKEDOWN.
+* **Доставки**: через **адаптер** (інтерфейс) з мок-API; логувати payload/response у `DeliveryJob`.
+* **Звіти**: імпорт мок-CSV раз на місяць у `ReportRow`; агрегації для /reports.
+* **Виплати**: Stripe Connect; блокувати вивід, якщо KYC не пройдений або борг/чарджбек.
+
+## API (скорочено)
+
+* **Auth**: `/api/auth/*` (NextAuth).
+* **Upload**: `/api/upload/presign` (S3 presigned URL, перевірка MIME/розміру).
+* **Releases**: CRUD `/api/releases`, `/api/releases/[id]/submit`, `/api/releases/[id]/takedown`.
+* **Tracks**: CRUD `/api/tracks`, `/api/tracks/[id]/audio`, `/api/tracks/[id]/lyrics`.
+* **Splits**: `/api/splits` (CRUD), інвайт за email.
+* **Delivery**: `/api/deliveries/queue`, cron `/api/jobs/deliveries/run`.
+* **Reports**: `/api/reports/import` (admin/mok), `/api/reports/summary?period=…`.
+* **Payouts**: `/api/payouts/balance`, `/api/payouts/request` (Stripe), webhooks `/api/stripe/webhook`.
+* **Admin/QC**: `/api/admin/qc`, `/api/admin/takedowns`, `/api/admin/users`.
+
+## Інтеграції (адаптери)
+
+* `DeliveryAdapter` інтерфейс: `prepareRelease(releaseId) → payload`, `send(payload) → response`, `status()`; реалізація `MockAdapter`.
+* Легко замінити на реальні агрегатори пізніше (FUGA, iMusician, Distro API тощо).
+
+## Валідації перед сабмітом
+
+* Наявність: artwork, хоча б 1 трек з валідним аудіо, релізна дата ≥ T+5 днів (конфігур.), заповнені автори/учасники, спліти = 100%.
+* Автоперевірка назв на типові порушення (з пріоритетом WARN, а не BLOCK, окрім критичних ERROR).
+
+## Нотифікації
+
+* Email/in-app: реліз відправлено на QC; QC remarks; доставлено/відхилено; нові звіти; payout статус.
+
+## Плани монетизації
+
+* **Free**: ліміт релізів/місяць, обмежені магазини (мок), затримка доставки.
+* **Pro**: більше релізів, пріоритетна доставка, додаткові DSP, кастомний UPC/ISRC, швидша підтримка.
+* Stripe Products/Prices, блокування сабміту при перевищенні лімітів.
+
+## ENV (приклад)
+
+```
+DATABASE_URL=postgresql://...
+NEXTAUTH_URL=...
+NEXTAUTH_SECRET=...
+
+S3_ENDPOINT=...
+S3_BUCKET=...
+S3_ACCESS_KEY=...
+S3_SECRET_KEY=...
+
+STRIPE_SECRET_KEY=...
+STRIPE_WEBHOOK_SECRET=...
+
+# Feature flags
+USE_MOCK_DELIVERY=true
+RELEASE_SUBMISSION_MIN_DAYS=5
+MAX_FREE_RELEASES_PER_MONTH=2
+```
+
+## Cron/Jobs
+
+* Щоденно 03:00 — `deliveries:run` (відправка APPROVED у DELIVERING→DELIVERED через мок).
+* Раз/місяць 05:00 — `reports:import` (мок CSV у `ReportRow`).
+* Щотижня — авто-QC для DRAFT з нагадуванням авторам.
+
+## Acceptance Criteria (MVP перевірка)
+
+* Реєстрація акаунта ARTIST/LABEL, створення організації, додавання артиста.
+* Створення релізу (single), додавання 1–3 треків, завантаження WAV + обкладинки, автогенерація UPC/ISRC.
+* Проходження QC (IN\_REVIEW → APPROVED), сабміт у магазини → DeliveryJob лог, статуси оновлюються.
+* Каталог показує релізи/треки з пошуком і фільтрами; сторінка релізу відображає повні метадані.
+* Імпорт мок-звітів відображає суму за період; можливість експорту CSV.
+* Налаштовані Stripe підписки (Free/Pro) та Stripe Connect для payout (демо-флоу).
+* Admin може бачити QC-чергу, ставити REJECT/APPROVE, виконувати takedown.
+
+## Нотатки до реалізації
+
+* Винести QC-правила у модуль `qc/rules.ts` (щоб легко доповнювати).
+* Зробити `DuplicateCheck` (простий пошук дублів по title+artist+duration±2с і по ISRC).
+* Зберігати оригінальні назви/рольову інформацію учасників (IP зручність).
+* В `AuditLog` фіксувати всі критичні дії: створення/оновлення релізів, сабміти, виплати.
+* У `Splits` підтримати “recoup” пізніше (не для MVP).
+* Передбачити multi-artist release (compilation) і різні primary artists по треках (MVP — опц.).
+* Міжнародні мови/локалі — базово EN + можливість UA пізніше.
+
+---
+
+Хочеш — можу під цей промпт підготувати скелет Next.js (порожні сторінки, Prisma схему, auth та базові форми) в одному файлі, щоб Replit згенерував одразу робочий репозиторій.
